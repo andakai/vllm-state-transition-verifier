@@ -1,4 +1,4 @@
-# vllm-rl-day0-kit
+# vllm-state-transition-verifier
 
 Standalone tooling for vLLM RL day-0 support:
 
