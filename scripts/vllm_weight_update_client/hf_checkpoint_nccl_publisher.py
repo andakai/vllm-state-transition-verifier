@@ -31,12 +31,9 @@ from vllm.distributed.weight_transfer import (
     ParamMeta,
     WeightSource,
 )
-from vllm.distributed.weight_transfer.nccl_common import (
-    NCCLWeightTransferInitInfo,
-    trainer_init,
-    worker_init_payload,
-)
 from vllm.distributed.weight_transfer.nccl_engine import (
+    NCCLTrainerInitInfo,
+    NCCLTrainerWeightTransferEngine,
     NCCLWeightTransferUpdateInfo,
 )
 from vllm.distributed.weight_transfer.packed_tensor import (
@@ -688,9 +685,6 @@ class NcclCheckpointPublisher:
             raise ValueError("prefetch max bucket bytes must be nonnegative")
         self.prefetch_max_bucket_bytes = prefetch_max_bucket_bytes
         self.timeout_seconds = timeout_seconds
-        # Match Vime's NCCL path: every bucket uses vLLM packed transfer,
-        # including MoE expert buckets.
-        self.packed = True
         self.group = None
         self.client: _TargetWeightSyncClient | None = None
         self.update_version = 0
@@ -701,24 +695,23 @@ class NcclCheckpointPublisher:
             raise RuntimeError("NCCL publisher is already initialized")
         torch.cuda.set_device(self.device)
         inference_world_size = self._get("/get_world_size")["world_size"]
-        init_info = NCCLWeightTransferInitInfo(
+        init_info = NCCLTrainerInitInfo(
             master_address=get_ip(),
             master_port=get_open_port(),
-            rank_offset=1,
             world_size=inference_world_size + 1,
+            rank=0,
             packed=True,
         )
         self.client = _TargetWeightSyncClient(
             self.base_url,
             timeout=self.timeout_seconds,
         )
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(
-                self.client.init_weight_transfer_engine,
-                worker_init_payload(init_info),
-            )
-            self.group = trainer_init(init_info)
-            future.result()
+        trainer_engine = NCCLTrainerWeightTransferEngine.trainer_init(
+            init_info,
+            client=self.client,
+            source=SafetensorsCheckpointSource(self.manifest, self.device),
+        )
+        self.group = trainer_engine.model_update_group
         return {
             "backend": "nccl",
             "inference_world_size": inference_world_size,
@@ -729,7 +722,7 @@ class NcclCheckpointPublisher:
                 "master_port": init_info.master_port,
                 "world_size": init_info.world_size,
             },
-            "trainer_transport": "NCCLWeightTransferEngine.trainer_send_weights",
+            "trainer_transport": "packed_nccl_broadcast_producer",
             "transport_mode": "packed",
         }
 
@@ -832,6 +825,7 @@ class NcclCheckpointPublisher:
         self.client.start_weight_update()
         start_seconds = time.perf_counter() - start_started
         update_failed = False
+
         def materialize_one(bucket: WeightTransferBucket):
             named_tensors, materialize_seconds = _materialize_bucket_for_device(
                 source_iter,

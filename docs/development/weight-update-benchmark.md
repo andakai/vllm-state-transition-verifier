@@ -119,4 +119,6 @@ within one running worker.
 The update durations exclude model startup and staging. One DeepSeek cold
 receiver reported 6,975.30 s model loading; GLM fresh B2 TP2 reported
 93.43–93.47 s model loading per rank. Temporary SSD copies were removed
-after the tests.
+after the tests. The later NCCL trainer API compatibility merge has not been
+remeasured with a full model, so these timings describe the validated
+pre-merge publisher.
