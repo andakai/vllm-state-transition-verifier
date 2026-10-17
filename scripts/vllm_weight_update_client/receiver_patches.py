@@ -23,6 +23,12 @@ General:
   never unpacked again. The unpack also replays learned routes, and learns
   the tensors ``load_weights`` copies into a tensor layerwise never reloads
   (replayed as that copy) or drops (left packed).
+* ``safetensors_shared_mmap``: vLLM's default safetensors iterator hands out
+  tensors whose host-to-device copies are slow even from the page cache.
+  Files are mapped read-only and shared instead: copies read the page cache
+  directly, a node's workers share it, and only what a loader reads is read.
+  Learned skips, routes and copies are replayed as in the unpack. The views
+  are read-only: a loader writing into its input would fault.
 * ``routed_expert_copy_replay``: copies a materialized expert layer's
   buffered weights per (parameter, geometry) group instead of one Python
   loader call per expert tensor.
@@ -53,10 +59,13 @@ import bisect
 import contextlib
 import functools
 import inspect
+import json
 import logging
 import math
+import mmap
 import sys
 import types
+import warnings
 import weakref
 from collections.abc import Callable
 
@@ -70,6 +79,29 @@ _SCALARS = (bool, int, float, str, type(None))
 _EXPERT_LOADER = (
     "self param loaded_weight weight_name shard_id expert_id return_success"
 )
+SAFETENSORS_DTYPES = {
+    name: getattr(torch, attr)
+    for name, attr in {
+        "BOOL": "bool",
+        "U8": "uint8",
+        "I8": "int8",
+        "I16": "int16",
+        "U16": "uint16",
+        "F16": "float16",
+        "BF16": "bfloat16",
+        "I32": "int32",
+        "U32": "uint32",
+        "F32": "float32",
+        "F64": "float64",
+        "I64": "int64",
+        "U64": "uint64",
+        "F8_E4M3": "float8_e4m3fn",
+        "F8_E5M2": "float8_e5m2",
+        "F8_E8M0": "float8_e8m0fnu",
+    }.items()
+    if hasattr(torch, attr)
+}
+
 # Learned per transfer name (a checkpoint tensor name), valid for the life of
 # the worker:
 SKIP_NAMES: set[str] = set()  # never handed to the model again
@@ -82,6 +114,7 @@ _TRANSFER_NAME: dict[int, tuple[str, int]] = {}
 _LOADED_NOW: set[str] = set()
 _IPC_UNPACK = [False]  # vLLM's IPC consumer is unpacking the sender's buffer
 _RECV_POOLS: dict[str, list] = {}  # packed NCCL receive buffers per device
+_FILE_MAPS: dict[int, int] = {}  # mapped checkpoint files: start -> end address
 
 PATCHES: dict[str, Callable[[], str]] = {}
 APPLIED: dict[str, str] = {}
@@ -656,6 +689,114 @@ def _skip_nonlocal_experts() -> str:
     return _all_applied(*results)
 
 
+def _file_mapped(t: torch.Tensor) -> bool:
+    ptr = t.data_ptr()
+    return any(a <= ptr < b for a, b in _FILE_MAPS.items())
+
+
+def read_safetensors_header(path: str) -> tuple[dict, int]:
+    """A safetensors file's tensor entries, and the offset their data starts at."""
+    with open(path, "rb") as f:
+        n = int.from_bytes(f.read(8), "little")
+        header = json.loads(f.read(n))
+    header.pop("__metadata__", None)
+    return header, 8 + n
+
+
+def mapped_safetensors(path: str):
+    """``(name, tensor)`` of one safetensors file in safetensors' key order:
+    views of the file mapped read-only and shared, i.e. of the page cache
+    (nothing is read until used). An entry that cannot be viewed (dtype,
+    alignment) is read by safetensors."""
+    from safetensors import safe_open
+
+    header, data_start = read_safetensors_header(path)
+    with open(path, "rb") as f:
+        mapping = mmap.mmap(f.fileno(), 0, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # not writable: loaders only read it
+        data = torch.frombuffer(mapping, dtype=torch.uint8)
+    start = data.data_ptr()
+    _FILE_MAPS[start] = start + data.numel()
+    weakref.finalize(mapping, _FILE_MAPS.pop, start, None)
+    with contextlib.ExitStack() as stack:
+        fallback = None
+        for name in sorted(header):
+            entry = header[name]
+            dtype = SAFETENSORS_DTYPES.get(entry["dtype"])
+            a, b = (data_start + x for x in entry["data_offsets"])
+            if (
+                dtype is not None
+                and a % dtype.itemsize == 0
+                and math.prod(entry["shape"]) * dtype.itemsize == b - a
+            ):
+                yield name, data[a:b].view(dtype).view(entry["shape"])
+            else:
+                if fallback is None:
+                    fallback = stack.enter_context(safe_open(path, framework="pt"))
+                yield name, fallback.get_tensor(name)
+
+
+@patch("safetensors_shared_mmap")
+def _safetensors_shared_mmap() -> str:
+    import vllm.model_executor.model_loader.default_loader as dl
+    import vllm.model_executor.model_loader.weight_utils as wu
+
+    if not all(hasattr(wu, f) for f in ("should_skip_weight", "_natural_sort_key")):
+        return "skipped: weight_utils helpers not found"
+    original_fn = wu.safetensors_weights_iterator
+
+    def new(original):
+        @functools.wraps(original)
+        def safetensors_weights_iterator(
+            hf_weights_files,
+            use_tqdm_on_load,
+            safetensors_load_strategy=None,
+            local_expert_ids=None,
+            **kwargs,
+        ):
+            if safetensors_load_strategy not in (None, "lazy"):
+                yield from original(
+                    hf_weights_files,
+                    use_tqdm_on_load,
+                    safetensors_load_strategy,
+                    local_expert_ids,
+                    **kwargs,
+                )
+                return
+            _TRANSFER_NAME.clear()
+            _LOADED_NOW.clear()
+            try:
+                for path in sorted(hf_weights_files, key=wu._natural_sort_key):
+                    for name, t in mapped_safetensors(path):
+                        if name in SKIP_NAMES or wu.should_skip_weight(
+                            name, local_expert_ids
+                        ):
+                            continue
+                        if _replay(name, t):
+                            continue
+                        if t.numel():
+                            _TRANSFER_NAME[t.data_ptr()] = (
+                                name,
+                                t.numel() * t.element_size(),
+                            )
+                        yield name, t
+            finally:
+                _TRANSFER_NAME.clear()
+
+        return safetensors_weights_iterator
+
+    want = (
+        "hf_weights_files use_tqdm_on_load safetensors_load_strategy "
+        "local_expert_ids safetensors_prefetch_num_threads "
+        "safetensors_prefetch_block_size"
+    )
+    result = _replace(wu, "safetensors_weights_iterator", new, want)
+    if getattr(dl, "safetensors_weights_iterator", None) is original_fn:
+        dl.safetensors_weights_iterator = wu.safetensors_weights_iterator
+    return result
+
+
 @patch("routed_expert_copy_replay")
 def _routed_expert_copy_replay() -> str:
     """A routed-expert loader call runs ~45 us of Python to end in one copy
@@ -830,7 +971,11 @@ def _routed_expert_copy_replay() -> str:
             dst = getattr(layer, name).data.as_strided(
                 (len(members), *dsize), (step, *dstride), off0
             )
-            dst.copy_(torch.stack(srcs))  # one gather kernel, one strided copy
+            if srcs[0].device == dst.device:
+                dst.copy_(torch.stack(srcs))  # one gather kernel, one strided copy
+            else:  # host sources (a reload from files): no host-side stack
+                for d, s in zip(dst, srcs):
+                    d.copy_(s)
         info.loaded_weights[:] = [items[k] for k in rest]
 
     def new_materialize(original):
@@ -1109,11 +1254,14 @@ def _async_layer_copies() -> str:
         return False
 
     def pageable(t) -> bool:
+        # a mapped checkpoint file is copied from directly: staging it through
+        # pinned memory is the slower way
         return (
             isinstance(t, torch.Tensor)
             and t.device.type == "cpu"
             and not t.is_pinned()
             and t.numel() * t.element_size() <= small
+            and not _file_mapped(t)
         )
 
     class AsyncCopies(TorchFunctionMode):
