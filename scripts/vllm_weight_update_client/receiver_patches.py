@@ -51,6 +51,17 @@ General:
 * ``attention_reload_keep_storage``: a re-created attention parameter or
   buffer is copied into the storage CUDA graphs captured, so the graphs read
   the new values (NaN after level-2 sleep otherwise).
+
+Model-specific correctness fixes, applied once the model's module is imported:
+
+* ``kimi_k3``: KDA ``in_proj`` padding rows and decode buffers no checkpoint
+  provides kept every KDA layer from completing during a reload.
+* ``glm5``: FP8 attention weight / scale pairs split across update buckets
+  were never loaded, and two caches derived on the first forward
+  (``_wp_fp32``, ``_merged_conv_weight``) kept the first weights.
+* ``deepseek_v41``: the mega attention's one-time ``wq_b`` / ``wo_a``
+  permutation is redone for reloaded tensors, and the first layer's mHC
+  broadcast is not derived while that layer is mid-reload.
 """
 
 from __future__ import annotations
@@ -117,12 +128,21 @@ _RECV_POOLS: dict[str, list] = {}  # packed NCCL receive buffers per device
 _FILE_MAPS: dict[int, int] = {}  # mapped checkpoint files: start -> end address
 
 PATCHES: dict[str, Callable[[], str]] = {}
+MODEL_FIXES: dict[str, tuple[str, Callable[[], str]]] = {}
 APPLIED: dict[str, str] = {}
 
 
 def patch(name: str):
     def register(fn: Callable[[], str]) -> Callable[[], str]:
         PATCHES[name] = fn
+        return fn
+
+    return register
+
+
+def model_fix(name: str, module: str):
+    def register(fn: Callable[[], str]) -> Callable[[], str]:
+        MODEL_FIXES[name] = (module, fn)
         return fn
 
     return register
@@ -1364,9 +1384,235 @@ def _attention_reload_keep_storage() -> str:
     return _replace(lw, "_finalize_attention_layer", new, params)
 
 
+# ---------------------------------------------------------------- models
+
+
+def _padding_param(linear, param) -> bool:
+    rows = getattr(linear, "_receiver_padding_rows", 0)
+    dim, weight = getattr(param, "output_dim", None), linear.weight
+    return (
+        rows > 0
+        and dim is not None
+        and param.shape[dim] == weight.shape[getattr(weight, "output_dim", 0)]
+    )
+
+
+def _zero_padding(linear, param) -> None:
+    # a reload materializes the weight uninitialized; keep the rows zero
+    if _padding_param(linear, param):
+        dim, rows = param.output_dim, linear._receiver_padding_rows
+        param.data.narrow(dim, param.shape[dim] - rows, rows).zero_()
+
+
+@model_fix("kimi_k3", "vllm.models.kimi_k3.nvidia.kda")
+def _kimi_k3() -> str:
+    """Declare the checkpoint element counts of the KDA ``in_proj`` (whose
+    padding rows no checkpoint provides) and of the decode buffers that
+    sub-module loaders fill, and keep the padding rows zero after a load."""
+    import vllm.models.kimi_k3.nvidia.kda as kda
+
+    def new_loader(original):
+        @functools.wraps(original)
+        def loader(self, param, *args, **kwargs):
+            ret = original(self, param, *args, **kwargs)
+            _zero_padding(self, param)
+            return ret
+
+        return loader
+
+    def new_init(original):
+        @functools.wraps(original)
+        def __init__(self, *args, **kwargs):
+            original(self, *args, **kwargs)
+            rows = int(getattr(self, "in_proj_padding", 0) or 0)
+            proj = getattr(self, "in_proj_qkvgfab", None)
+            if rows and proj is not None:
+                proj._receiver_padding_rows = rows
+                for param in proj.parameters():
+                    if _padding_param(proj, param):
+                        total = param.shape[param.output_dim]
+                        param.weight_loader_numel = (
+                            param.numel() // total * (total - rows)
+                        )
+                _zero_padding(proj, proj.weight)
+            for name in ("decode_conv1d_weight", "decode_norm_weight"):
+                buf = getattr(self, name, None)
+                if isinstance(buf, torch.Tensor):
+                    buf.weight_loader_numel = 0  # filled by a sub-module's loader
+
+        return __init__
+
+    linear = kda._KimiGDNMergedColumnParallelLinear
+    return _all_applied(
+        _replace(linear, "weight_loader", new_loader),
+        _replace(linear, "weight_loader_v2", new_loader),
+        _replace(kda.KimiK3DeltaAttention, "__init__", new_init),
+    )
+
+
+@model_fix("glm5", "vllm.models.glm5next.common.model")
+def _glm5() -> str:
+    """Keep FP8 weight / scale halves pending across ``load_weights`` calls
+    (one per update bucket), and recompute the lazily derived caches into
+    their storage after every update."""
+    import vllm.model_executor.model_loader.reload.layerwise as lw
+    import vllm.models.glm5next.common.attention as ga
+    import vllm.models.glm5next.common.kda as gk
+    import vllm.models.glm5next.common.model as gm
+
+    pending: dict = {}  # layer prefix -> the halves seen so far
+
+    def new_pair(original):
+        @functools.wraps(original)
+        def try_load(name, tensor, buf, *args, **kwargs):
+            return original(name, tensor, pending, *args, **kwargs)
+
+        return try_load
+
+    def refresh(model) -> None:
+        for m in model.modules():
+            if isinstance(m, ga.Indexer) and m._wp_fp32 is not None:
+                m._wp_fp32.copy_(m.wk_weights_proj.weight.data[m.head_dim :, :].t())
+            elif (
+                isinstance(m, gk.Glm5NextLinearAttention)
+                and m._merged_conv_weight is not None
+            ):
+                convs = (m.q_conv1d, m.k_conv1d, m.v_conv1d)
+                weights = [
+                    c.weight.view(c.weight.size(0), c.weight.size(2)) for c in convs
+                ]
+                m._merged_conv_weight.copy_(torch.cat(weights, dim=0))
+
+    def new_finalize(original):
+        @functools.wraps(original)
+        def finalize_layerwise_processing(model, model_config):
+            original(model, model_config)
+            with torch.inference_mode():  # the caches are inference tensors
+                refresh(model)
+
+        return finalize_layerwise_processing
+
+    pair = "name tensor buf params_dict loaded_params"
+    return _all_applied(
+        _replace(gm, "_try_load_fp8_attn_proj", new_pair, pair + " kv_a_pad_size"),
+        _replace(gm, "_try_load_fp8_indexer_wk", new_pair, pair),
+        _replace(
+            lw, "finalize_layerwise_processing", new_finalize, "model model_config"
+        ),
+    )
+
+
+@model_fix("deepseek_v41", "vllm.models.deepseek_v41.nvidia.model")
+def _deepseek_v41() -> str:
+    """The mega attention permutes ``wq_b`` / ``wo_a`` once after the first
+    load (guarded by ``_fused_layouts_ready``); a reloaded tensor of a
+    permuted layer is permuted the same way, after loading and before its
+    quantization method converts it. The model derives the first layer's mHC
+    broadcast after every ``load_weights`` call; skip that while the layer is
+    still being reloaded (meta)."""
+    import vllm.model_executor.model_loader.reload.layerwise as lw
+    import vllm.models.deepseek_v41.nvidia.flash_mla_mega_attn as mega
+    import vllm.models.deepseek_v41.nvidia.model as dsm
+
+    def new_init(original):
+        @functools.wraps(original)
+        def __init__(self, *args, **kwargs):
+            original(self, *args, **kwargs)
+            for name in ("wq_b", "wo_a"):
+                getattr(self, name)._receiver_mega_attn = (weakref.ref(self), name)
+
+        return __init__
+
+    def permute(layer, attn, name):
+        if name == "wq_b":
+            mega.permute_wq_b_(
+                layer.weight.data, layer.weight_scale.data, attn.n_local_heads
+            )
+        else:
+            heads = attn.n_local_heads // attn.n_local_groups
+            mega.permute_wo_a_(layer.weight.data, layer.weight_scale.data, heads)
+
+    def new_process(original):
+        @functools.wraps(original)
+        def _layerwise_process(layer, info):
+            owner = getattr(layer, "_receiver_mega_attn", None)
+            attn = (
+                owner[0]()
+                if owner is not None and info.kernel_tensors is not None
+                else None
+            )
+            qm = getattr(layer, "quant_method", None)  # one instance per layer
+            if attn is None or not attn._fused_layouts_ready or qm is None:
+                return original(layer, info)
+            convert = qm.process_weights_after_loading
+
+            def process_weights_after_loading(lyr):
+                permute(lyr, attn, owner[1])
+                convert(lyr)
+
+            qm.process_weights_after_loading = process_weights_after_loading
+            try:
+                return original(layer, info)
+            finally:
+                del qm.process_weights_after_loading
+
+        return _layerwise_process
+
+    def new_mhc(original):
+        @functools.wraps(original)
+        def finalize_mhc_broadcast_weights(self):
+            first = (
+                self.layers[self.start_layer]
+                if self.start_layer < self.end_layer
+                else None
+            )
+            if getattr(getattr(first, "hc_attn_fn", None), "is_meta", False):
+                return None
+            return original(self)
+
+        return finalize_mhc_broadcast_weights
+
+    return _all_applied(
+        _replace(mega.DeepseekV4MegaAttnAttention, "__init__", new_init),
+        _replace(lw, "_layerwise_process", new_process, "layer info"),
+        _replace(
+            dsm.DeepseekV4Model, "finalize_mhc_broadcast_weights", new_mhc, "self"
+        ),
+    )
+
+
+# ---------------------------------------------------------------- entry
+
+
+def _apply_model_fixes() -> None:
+    for name, (module, fn) in MODEL_FIXES.items():
+        if name not in APPLIED and module in sys.modules:
+            _run(name, fn)
+            logger.info("receiver_patches %s: %s", name, APPLIED[name])
+
+
+@patch("model_fixes")
+def _model_fixes() -> str:
+    """Apply the model fixes once vLLM resolves the model class: its module is
+    imported then, before the model is built."""
+    import vllm.model_executor.model_loader.utils as mlu
+
+    def new(original):
+        @functools.wraps(original)
+        def get_model_architecture(model_config):
+            result = original(model_config)
+            _apply_model_fixes()
+            return result
+
+        return get_model_architecture
+
+    return _replace(mlu, "get_model_architecture", new)
+
+
 def apply() -> dict[str, str]:
     for name, fn in PATCHES.items():
         if name not in APPLIED:
             _run(name, fn)
+    _apply_model_fixes()
     logger.info("receiver_patches: %s", APPLIED)
     return dict(APPLIED)
